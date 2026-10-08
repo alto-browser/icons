@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'icons/**'
+  workflow_dispatch:
+    inputs:
+      domains:
+        description: 'Domains to republish, space separated, or "all"'
+        required: true
+        default: all
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out which domains changed
+        id: domains
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REQUESTED: ${{ inputs.domains }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          all_domains() {
+            [ -d icons ] || return 0
+            find icons -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort
+          }
+
+          if [ "$EVENT" = workflow_dispatch ]; then
+            if [ "$REQUESTED" = all ]; then
+              all_domains > candidates.txt
+            else
+              printf '%s' "$REQUESTED" | tr ' ,' '\n\n' > candidates.txt
+            fi
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+               || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            echo "The previous commit is unavailable, republishing every domain."
+            all_domains > candidates.txt
+          else
+            git diff --name-only "$BEFORE" "$AFTER" -- icons/ \
+              | awk -F/ 'NF >= 3 { print $2 }' > candidates.txt
+          fi
+
+          sort -u candidates.txt \
+            | grep -E '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' \
+            | grep -v '\.lock$' > domains.txt || true
+
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            grep -qxF -- "$line" domains.txt \
+              || echo "::warning::Skipping '$line', which is not a usable domain name."
+          done < <(sort -u candidates.txt)
+
+          echo "Domains to sync:"
+          cat domains.txt
+          if [ -s domains.txt ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create, update or delete each domain's release
+        if: steps.domains.outputs.any == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          failed=0
+          while IFS= read -r domain; do
+            [ -n "$domain" ] || continue
+            echo "::group::$domain"
+            if ! bash scripts/sync-release.sh "$domain"; then
+              echo "::error::Failed to sync the release for '$domain'."
+              failed=$((failed + 1))
+            fi
+            echo "::endgroup::"
+          done < domains.txt
+
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::$failed domain(s) could not be published."
+            exit 1
+          fi
