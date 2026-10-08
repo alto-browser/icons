@@ -1,0 +1,88 @@
+name: PR check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  assets:
+    name: assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          path: pr
+          fetch-depth: 0
+
+      - name: Check out the checks from the base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          sparse-checkout: scripts
+
+      - name: Install icon tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq icnsutils
+
+      - name: Collect the changed paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mkdir -p out
+          git -C pr diff --name-only -z "$BASE_SHA" HEAD > out/changed.z
+          echo "Changed paths:"
+          tr '\0' '\n' < out/changed.z
+
+      - name: Validate the changed paths
+        id: validate
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          REPORT: out/report.md
+        run: |
+          if bash base/scripts/validate-assets.sh pr out/changed.z; then
+            echo pass > out/result.txt
+          else
+            echo fail > out/result.txt
+          fi
+
+      - name: Render ICNS previews
+        continue-on-error: true
+        env:
+          REPORT: out/report.md
+        run: bash base/scripts/render-previews.sh pr out/changed.z out
+
+      - name: Record the pull request details
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s\n' "$PR_NUMBER" > out/pr-number.txt
+          printf '%s\n' "$HEAD_SHA" > out/head-sha.txt
+
+      - name: Publish the report to the run summary
+        run: cat out/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report and previews
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-assets
+          path: out
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Fail if validation rejected the pull request
+        run: |
+          if [ "$(cat out/result.txt)" != pass ]; then
+            echo "::error::This pull request changes files that are not dock icon assets, or the assets are invalid. See the run summary."
+            exit 1
+          fi
